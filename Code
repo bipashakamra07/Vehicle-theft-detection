@@ -1,0 +1,137 @@
+#include <Wire.h>
+#include <TinyGPS++.h>
+#include <SoftwareSerial.h>
+#include <ESP8266WiFi.h>
+#include <ESP8266HTTPClient.h>
+
+// Wi-Fi credentials
+const char* ssid = "AG";       // Replace with your Wi-Fi SSID
+const char* password = "a119xwoo"; // Replace with your Wi-Fi password
+
+// Google Apps Script Web App URL (for sending data to Google Sheets)
+const char* googleScriptUrl = "https://script.google.com/macros/s/AKfycbyT7g0oT7IGSSc0uDY-9yiwSiNbpd0TocKo-e0lbqYq2JsgFhEnw0KERcnvo4181-52wQ/exec"; // Replace with your Google Apps Script URL
+
+// Pin definitions
+const int relayPin = D1;  // Relay pin (connected to car engine)
+const int buttonPin = D2; // Button pin (two-pin momentary push button)
+const int mpu6050Address = 0x68; // MPU6050 I2C address
+
+// MPU6050 variables
+int16_t ax, ay, az; // Acceleration values
+
+// GPS variables
+TinyGPSPlus gps;
+SoftwareSerial gpsSerial(D6, D7); // RX (D6), TX (D7)
+
+// WiFi client object
+WiFiClient client;
+
+// Variables for button and relay state
+bool relayState = false; // Current state of the relay
+bool lastButtonState = HIGH; // Previous state of the button
+bool carMoving = false; // Flag to track if the car is moving
+
+void setup() {
+  Serial.begin(9600);
+  gpsSerial.begin(9600);
+  Wire.begin();
+  WiFi.begin(ssid, password);
+
+  // Initialize MPU6050
+  Wire.beginTransmission(mpu6050Address);
+  Wire.write(0x6B); // PWR_MGMT_1 register
+  Wire.write(0);    // Wake up MPU6050
+  Wire.endTransmission(true);
+
+  // Set pin modes
+  pinMode(relayPin, OUTPUT);
+  pinMode(buttonPin, INPUT_PULLUP); // Button pin with internal pull-up resistor
+
+  // Wait for Wi-Fi connection
+  while (WiFi.status() != WL_CONNECTED) {
+    delay(500);
+    Serial.print(".");
+  }
+  Serial.println("WiFi connected");
+}
+
+void loop() {
+  // Read button state
+  bool buttonState = digitalRead(buttonPin);
+
+  // Check for button press (LOW because of pull-up resistor)
+  if (buttonState == LOW && lastButtonState == HIGH) {
+    // Toggle relay state
+    relayState = !relayState;
+    digitalWrite(relayPin, relayState ? HIGH : LOW);
+    Serial.println(relayState ? "Relay ON (Engine started)" : "Relay OFF (Engine stopped)");
+    delay(500); // Debounce delay
+  }
+  lastButtonState = buttonState; // Save the current button state
+
+  // If relay is OFF, check for unauthorized movement
+  if (!relayState) {
+    // Read MPU6050 acceleration values
+    Wire.beginTransmission(mpu6050Address);
+    Wire.write(0x3B); // Start with register 0x3B (ACCEL_XOUT_H)
+    Wire.endTransmission(false);
+    Wire.requestFrom(mpu6050Address, 6, true); // Read 6 registers
+    ax = Wire.read() << 8 | Wire.read();
+    ay = Wire.read() << 8 | Wire.read();
+    az = Wire.read() << 8 | Wire.read();
+
+    // Check if acceleration exceeds a threshold (car is moving)
+    if (abs(ax) > 10000 || abs(ay) > 10000 || abs(az) > 10000) {
+      if (!carMoving) {
+        carMoving = true;
+        Serial.println("Unauthorized movement detected!");
+        sendLocation(); // Send location to Google Sheets
+      }
+    } else {
+      carMoving = false; // Reset car movement flag if no acceleration is detected
+    }
+  }
+
+  // Process GPS data
+  while (gpsSerial.available() > 0) {
+    gps.encode(gpsSerial.read());
+  }
+}
+
+void sendLocation() {
+  if (WiFi.status() == WL_CONNECTED) {
+    // Get GPS location
+    if (gps.location.isValid()) {
+      float latitude = gps.location.lat();
+      float longitude = gps.location.lng();
+
+      // Print GPS data to Serial Monitor
+      Serial.print("Latitude: ");
+      Serial.println(latitude, 6);
+      Serial.print("Longitude: ");
+      Serial.println(longitude, 6);
+
+      // Prepare JSON payload
+      String payload = "{\"latitude\": " + String(latitude, 6) + ", \"longitude\": " + String(longitude, 6) + "}";
+
+      // Send HTTP POST request to Google Apps Script
+      HTTPClient http;
+      http.begin(client, googleScriptUrl); // Use the new begin() method
+      http.addHeader("Content-Type", "application/json");
+      int httpCode = http.POST(payload);
+
+      if (httpCode > 0) {
+        Serial.println("Location sent to Google Sheets!");
+      } else {
+        Serial.println("Failed to send location to Googl
+        
+        e Sheets.");
+      }
+      http.end();
+    } else {
+      Serial.println("GPS data not valid.");
+    }
+  } else {
+    Serial.println("WiFi not connected.");
+  }
+}
